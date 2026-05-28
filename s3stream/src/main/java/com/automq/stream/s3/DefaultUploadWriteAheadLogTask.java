@@ -62,6 +62,7 @@ public class DefaultUploadWriteAheadLogTask implements UploadWriteAheadLogTask {
     private long startTimestamp;
     private long uploadTimestamp;
     private long commitTimestamp;
+    private final List<PreparedObject> preparedObjects;
     private volatile CommitStreamSetObjectRequest commitStreamSetObjectRequest;
     private volatile boolean burst = false;
 
@@ -79,6 +80,7 @@ public class DefaultUploadWriteAheadLogTask implements UploadWriteAheadLogTask {
         this.executor = executor;
         this.rate = rate;
         this.limiter = new AsyncRateLimiter(rate);
+        this.preparedObjects = new ArrayList<>(streamRecordsMap.size());
     }
 
     public static Builder builder() {
@@ -88,18 +90,41 @@ public class DefaultUploadWriteAheadLogTask implements UploadWriteAheadLogTask {
     @Override
     public CompletableFuture<Long> prepare() {
         startTimestamp = System.currentTimeMillis();
-        if (forceSplit) {
-            prepareCf.complete(NOOP_OBJECT_ID);
-        } else {
-            objectManager
-                .prepareObject(1, TimeUnit.MINUTES.toMillis(60))
-                .thenAcceptAsync(prepareCf::complete, executor)
-                .exceptionally(ex -> {
-                    prepareCf.completeExceptionally(ex);
-                    return null;
-                });
-        }
+        int objectCount = prepareObjects();
+        objectManager
+            .prepareObject(objectCount, TimeUnit.MINUTES.toMillis(60))
+            .thenAcceptAsync(objectId -> {
+                long streamSetObjectId = forceSplit ? NOOP_OBJECT_ID : objectId++;
+                for (PreparedObject preparedObject : preparedObjects) {
+                    if (preparedObject.split) {
+                        preparedObject.objectId = objectId++;
+                    }
+                }
+                prepareCf.complete(streamSetObjectId);
+            }, executor)
+            .exceptionally(ex -> {
+                prepareCf.completeExceptionally(ex);
+                return null;
+            });
         return prepareCf;
+    }
+
+    private int prepareObjects() {
+        List<Long> streamIds = new ArrayList<>(streamRecordsMap.keySet());
+        Collections.sort(streamIds);
+        int objectCount = forceSplit ? 0 : 1;
+        for (Long streamId : streamIds) {
+            List<StreamRecordBatch> streamRecords = streamRecordsMap.get(streamId);
+            int streamSize = streamRecords.stream().mapToInt(StreamRecordBatch::size).sum();
+            long startOffset = streamRecords.get(0).getBaseOffset();
+            long endOffset = streamRecords.get(streamRecords.size() - 1).getLastOffset();
+            boolean split = forceSplit || streamSize >= streamSplitSizeThreshold;
+            if (split) {
+                objectCount++;
+            }
+            preparedObjects.add(new PreparedObject(streamId, streamRecords, startOffset, endOffset, streamSize, split));
+        }
+        return objectCount;
     }
 
     /**
@@ -131,8 +156,6 @@ public class DefaultUploadWriteAheadLogTask implements UploadWriteAheadLogTask {
 
     void upload0(long objectId) {
         uploadTimestamp = System.currentTimeMillis();
-        List<Long> streamIds = new ArrayList<>(streamRecordsMap.keySet());
-        Collections.sort(streamIds);
         CommitStreamSetObjectRequest request = new CommitStreamSetObjectRequest();
 
         ObjectWriter streamSetObject;
@@ -146,20 +169,18 @@ public class DefaultUploadWriteAheadLogTask implements UploadWriteAheadLogTask {
         List<CompletableFuture<Void>> streamObjectCfList = new LinkedList<>();
 
         List<CompletableFuture<Void>> streamSetWriteCfList = new LinkedList<>();
-        for (Long streamId : streamIds) {
-            List<StreamRecordBatch> streamRecords = streamRecordsMap.get(streamId);
-            int streamSize = streamRecords.stream().mapToInt(StreamRecordBatch::size).sum();
-            if (forceSplit || streamSize >= streamSplitSizeThreshold) {
-                streamObjectCfList.add(writeStreamObject(streamRecords, streamSize).thenAccept(so -> {
+        for (PreparedObject preparedObject : preparedObjects) {
+            if (preparedObject.split) {
+                streamObjectCfList.add(writeStreamObject(preparedObject).thenAccept(so -> {
                     synchronized (request) {
                         request.addStreamObject(so);
                     }
                 }));
             } else {
-                streamSetWriteCfList.add(acquireLimiter(streamSize).thenAccept(nil -> streamSetObject.write(streamId, streamRecords)));
-                long startOffset = streamRecords.get(0).getBaseOffset();
-                long endOffset = streamRecords.get(streamRecords.size() - 1).getLastOffset();
-                request.addStreamRange(new ObjectStreamRange(streamId, -1L, startOffset, endOffset, streamSize));
+                streamSetWriteCfList.add(acquireLimiter(preparedObject.streamSize)
+                    .thenAccept(nil -> streamSetObject.write(preparedObject.streamId, preparedObject.records)));
+                request.addStreamRange(new ObjectStreamRange(preparedObject.streamId, -1L, preparedObject.startOffset, preparedObject.endOffset,
+                    preparedObject.streamSize));
             }
         }
         request.setObjectId(objectId);
@@ -207,26 +228,43 @@ public class DefaultUploadWriteAheadLogTask implements UploadWriteAheadLogTask {
         });
     }
 
-    private CompletableFuture<StreamObject> writeStreamObject(List<StreamRecordBatch> streamRecords, int streamSize) {
-        CompletableFuture<Long> cf = objectManager.prepareObject(1, TimeUnit.MINUTES.toMillis(60));
-        cf = cf.thenCompose(objectId -> acquireLimiter(streamSize).thenApply(nil -> objectId));
-        return cf.thenComposeAsync(objectId -> {
+    private CompletableFuture<StreamObject> writeStreamObject(PreparedObject preparedObject) {
+        return acquireLimiter(preparedObject.streamSize).thenComposeAsync(nil -> {
+            long objectId = preparedObject.objectId;
+            long streamId = preparedObject.streamId;
+            List<StreamRecordBatch> streamRecords = preparedObject.records;
             ObjectWriter streamObjectWriter = ObjectWriter.writer(objectId, objectStorage, objectBlockSize, objectPartSize);
-            long streamId = streamRecords.get(0).getStreamId();
             streamObjectWriter.write(streamId, streamRecords);
-            long startOffset = streamRecords.get(0).getBaseOffset();
-            long endOffset = streamRecords.get(streamRecords.size() - 1).getLastOffset();
             StreamObject streamObject = new StreamObject();
             streamObject.setObjectId(objectId);
             streamObject.setStreamId(streamId);
-            streamObject.setStartOffset(startOffset);
-            streamObject.setEndOffset(endOffset);
-            return streamObjectWriter.close().thenApply(nil -> {
+            streamObject.setStartOffset(preparedObject.startOffset);
+            streamObject.setEndOffset(preparedObject.endOffset);
+            return streamObjectWriter.close().thenApply(ignored -> {
                 streamObject.setObjectSize(streamObjectWriter.size());
                 streamObject.setAttributes(ObjectAttributes.builder().bucket(streamObjectWriter.bucketId()).build().attributes());
                 return streamObject;
             });
         }, executor);
+    }
+
+    public static class PreparedObject {
+        private final long streamId;
+        private final List<StreamRecordBatch> records;
+        private final long startOffset;
+        private final long endOffset;
+        private final int streamSize;
+        private final boolean split;
+        private long objectId = NOOP_OBJECT_ID;
+
+        public PreparedObject(long streamId, List<StreamRecordBatch> records, long startOffset, long endOffset, int streamSize, boolean split) {
+            this.streamId = streamId;
+            this.records = records;
+            this.startOffset = startOffset;
+            this.endOffset = endOffset;
+            this.streamSize = streamSize;
+            this.split = split;
+        }
     }
 
     public static class Builder {
